@@ -1,54 +1,70 @@
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, flash
+# app.py
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, flash, send_file
 from functools import wraps
-import os
-import sqlite3
+import os, sqlite3, hmac, hashlib, json, csv, io, secrets, base64, time
 from datetime import datetime, timezone
-import hmac
+import requests
 
 DB_PATH = os.environ.get('DB_PATH', 'revocations.db')
-ADMIN_KEY = os.environ.get('ADMIN_KEY', 'CHANGE_ME')  # replace in Render env
+ADMIN_KEY = os.environ.get('ADMIN_KEY', None) or 'CHANGE_ME'  # rotate via UI
 API_KEY_HEADER = 'X-API-KEY'
+WEBHOOK_URLS = [u.strip() for u in (os.environ.get('WEBHOOK_URLS') or '').split(',') if u.strip()]
 
 app = Flask(__name__)
-# secret key used by Flask to flash messages in admin UI; not security-critical here
-app.secret_key = os.environ.get('FLASK_SECRET', 'dev-secret-for-flash')
+app.secret_key = os.environ.get('FLASK_SECRET', secrets.token_hex(16))
 
-# ------------- DB helpers -------------
+# ---------- DB ----------
 def get_conn():
-    c = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    c = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
     c.row_factory = sqlite3.Row
     return c
 
 def init_db():
     with get_conn() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS revocations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                license_id TEXT NOT NULL UNIQUE,
-                revoked_at TIMESTAMP NOT NULL,
-                reason TEXT,
-                revoked_by TEXT
-            )
+        conn.executescript('''
+        CREATE TABLE IF NOT EXISTS revocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_id TEXT NOT NULL UNIQUE,
+            revoked_at TIMESTAMP NOT NULL,
+            reason TEXT,
+            revoked_by TEXT
+        );
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TIMESTAMP NOT NULL,
+            event TEXT NOT NULL,
+            details TEXT
+        );
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id TEXT NOT NULL UNIQUE,
+            key_hash TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0
+        );
         ''')
         conn.commit()
 
-# ------------- admin check (accept header, query, json body, or form) -------------
+def log_activity(event: str, details: dict | str = None):
+    with get_conn() as conn:
+        conn.execute('INSERT INTO activity_logs (ts, event, details) VALUES (?,?,?)',
+                     (datetime.now(timezone.utc), event, json.dumps(details) if details is not None else None))
+        conn.commit()
+
+# ---------- admin auth ----------
 def _get_admin_key_from_request():
-    # priority: header -> query param -> json body -> form field
     key = request.headers.get(API_KEY_HEADER)
     if key:
         return key
     key = request.args.get('admin_key')
     if key:
         return key
-    # json body (if any)
     try:
         j = request.get_json(silent=True) or {}
         if isinstance(j, dict) and j.get('admin_key'):
             return j.get('admin_key')
     except Exception:
         pass
-    # form (from admin panel)
     if 'admin_key' in request.form:
         return request.form.get('admin_key')
     return None
@@ -58,16 +74,23 @@ def require_admin(fn):
     def wrapper(*args, **kwargs):
         key = _get_admin_key_from_request()
         if not key or not hmac.compare_digest(key, ADMIN_KEY):
-            # if JSON/REST call, return JSON 401
             if request.is_json or request.path.startswith('/api') or request.path.startswith('/revoke') or request.path.startswith('/unrevoke'):
                 return jsonify({'error': 'unauthorized'}), 401
-            # otherwise, for admin UI, redirect to admin page with flash
             flash('Unauthorized: invalid admin key', 'error')
             return redirect(url_for('admin'))
         return fn(*args, **kwargs)
     return wrapper
 
-# ------------- Routes -------------
+# ---------- webhooks ----------
+def notify_webhooks(payload: dict):
+    for url in WEBHOOK_URLS:
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception:
+            # swallow — logging in DB
+            log_activity('webhook_failed', {'url': url, 'payload': payload})
+
+# ---------- API ----------
 @app.route('/health')
 def health():
     return jsonify({'ok': True})
@@ -80,7 +103,6 @@ def server_time():
 @app.route('/revoke', methods=['POST'])
 @require_admin
 def revoke():
-    """Admin API: revoke license with reason (JSON or form)."""
     data = request.get_json(silent=True) or request.form or {}
     lid = data.get('license_id')
     reason = data.get('reason')
@@ -89,8 +111,11 @@ def revoke():
         return jsonify({'error': 'license_id required'}), 400
     now = datetime.now(timezone.utc)
     with get_conn() as conn:
-        conn.execute('INSERT OR REPLACE INTO revocations (license_id, revoked_at, reason, revoked_by) VALUES (?,?,?,?)', (lid, now, reason, by))
+        conn.execute('INSERT OR REPLACE INTO revocations (license_id, revoked_at, reason, revoked_by) VALUES (?,?,?,?)',
+                     (lid, now, reason, by))
         conn.commit()
+    log_activity('revoke', {'license_id': lid, 'reason': reason, 'by': by})
+    notify_webhooks({'event': 'revoke', 'license_id': lid, 'reason': reason, 'revoked_at': now.isoformat()})
     return jsonify({'revoked': True, 'license_id': lid, 'revoked_at': now.isoformat(), 'reason': reason})
 
 @app.route('/unrevoke', methods=['POST'])
@@ -98,11 +123,14 @@ def revoke():
 def unrevoke():
     data = request.get_json(silent=True) or request.form or {}
     lid = data.get('license_id')
+    by = data.get('by', 'admin')
     if not lid:
         return jsonify({'error': 'license_id required'}), 400
     with get_conn() as conn:
         conn.execute('DELETE FROM revocations WHERE license_id = ?', (lid,))
         conn.commit()
+    log_activity('unrevoke', {'license_id': lid, 'by': by})
+    notify_webhooks({'event': 'unrevoke', 'license_id': lid, 'by': by, 'time': datetime.now(timezone.utc).isoformat()})
     return jsonify({'revoked': False, 'license_id': lid})
 
 @app.route('/status/<license_id>')
@@ -114,124 +142,127 @@ def status(license_id):
         return jsonify({'revoked': True, 'license_id': r['license_id'], 'revoked_at': r['revoked_at'], 'reason': r['reason'], 'server_time': now.isoformat()})
     return jsonify({'revoked': False, 'license_id': license_id, 'server_time': now.isoformat()})
 
-# ---------------- Admin panel UI ----------------
-ADMIN_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>License Revocation — Admin</title>
-  <style>
-    body { font-family: Arial, Helvetica, sans-serif; margin: 28px; background:#0b0f10; color:#dfe; }
-    .card { background:#08121a; padding:20px; border-radius:8px; max-width:720px; margin:0 auto; box-shadow:0 2px 10px rgba(0,0,0,0.6); }
-    input[type=text], textarea { width:100%; padding:8px; margin:6px 0 12px 0; border-radius:4px; border:1px solid #234; background:#021; color:#dfe; }
-    label { font-weight:bold; display:block; margin-top:8px; }
-    .row { display:flex; gap:10px; }
-    .row > * { flex:1; }
-    button { padding:10px 14px; border-radius:6px; border:0; cursor:pointer; background:#06a; color:#001; font-weight:bold; }
-    .small { font-size:0.9rem; color:#9cffb2; }
-    .flash { padding:8px; margin-bottom:10px; border-radius:6px; }
-    .flash.error { background:#3b0c0c; color:#ffb2b2; }
-    .flash.ok { background:#083b10; color:#bff0c8; }
-    table { width:100%; border-collapse:collapse; margin-top:16px; }
-    th, td { padding:8px; border-bottom:1px solid #123; text-align:left; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>License Revocation — Admin Panel</h2>
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% for cat, msg in messages %}
-          <div class="flash {{cat}}">{{msg}}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
+# ---------- API key management ----------
+def _hash_key(k: str) -> str:
+    return hashlib.sha256(k.encode('utf-8')).hexdigest()
 
-    <form method="post" action="{{ url_for('admin_action') }}">
-      <label>ADMIN KEY (paste here)</label>
-      <input type="text" name="admin_key" placeholder="paste ADMIN_KEY" required>
+@app.route('/api/keys/rotate', methods=['POST'])
+@require_admin
+def rotate_api_key():
+    # generate new key and store hash; return plaintext once
+    new_key = secrets.token_hex(32)
+    key_id = secrets.token_hex(8)
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        conn.execute('INSERT INTO api_keys (key_id, key_hash, created_at, revoked) VALUES (?,?,?,0)', (key_id, _hash_key(new_key), now))
+        conn.commit()
+    log_activity('api_key_rotated', {'key_id': key_id})
+    return jsonify({'key_id': key_id, 'key': new_key})
 
-      <label>License ID</label>
-      <input type="text" name="license_id" placeholder="e.g. LIC-1234" required>
+@app.route('/admin/export.csv')
+@require_admin
+def export_csv():
+    # export revocations and activity logs as CSV (combined in separate tabs -> send as CSV with two sections)
+    sio = io.StringIO()
+    w = csv.writer(sio)
+    w.writerow(['revocations'])
+    w.writerow(['license_id','revoked_at','reason','revoked_by'])
+    with get_conn() as conn:
+        for r in conn.execute('SELECT license_id, revoked_at, reason, revoked_by FROM revocations ORDER BY revoked_at DESC'):
+            w.writerow([r['license_id'], r['revoked_at'], r['reason'], r['revoked_by']])
+    w.writerow([])
+    w.writerow(['activity_logs'])
+    w.writerow(['ts','event','details'])
+    with get_conn() as conn:
+        for r in conn.execute('SELECT ts, event, details FROM activity_logs ORDER BY ts DESC'):
+            w.writerow([r['ts'], r['event'], r['details']])
+    sio.seek(0)
+    return send_file(io.BytesIO(sio.getvalue().encode('utf-8')), mimetype='text/csv', download_name='revocations_activity.csv', as_attachment=True)
 
-      <label>Reason (for revocation)</label>
-      <textarea name="reason" rows="3" placeholder="Reason for revocation (optional)"></textarea>
+# ---------- Admin UI ----------
+ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Admin</title>
+<style>body{font-family:Arial;background:#071018;color:#dfe;} .card{max-width:980px;margin:24px auto;padding:18px;background:#08121a;border-radius:8px} input,textarea,select{width:100%;padding:8px;margin:6px 0;border-radius:6px;background:#02121a;color:#dfe;border:1px solid #233} table{width:100%;border-collapse:collapse;margin-top:12px}th,td{padding:8px;border-bottom:1px solid #123;text-align:left}</style>
+</head><body><div class="card">
+<h2>Revocation Admin</h2>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}{% for cat,msg in messages %}<div style="padding:8px;background:#222;margin-bottom:8px;border-radius:6px">{{msg}}</div>{% endfor %}{% endif %}
+{% endwith %}
+<form method="post" action="{{ url_for('admin_action') }}">
+<label>ADMIN KEY (paste)</label><input name="admin_key" required>
+<label>License ID</label><input name="license_id" placeholder="e.g. LIC-...">
+<label>Reason</label><textarea name="reason"></textarea>
+<div style="display:flex;gap:8px"><button name="action" value="revoke">Revoke</button><button name="action" value="unrevoke">Unrevoke</button><button name="action" value="list">List</button></div>
+</form>
 
-      <div class="row">
-        <button type="submit" name="action" value="revoke">Revoke</button>
-        <button type="submit" name="action" value="unrevoke">Unrevoke</button>
-        <button type="submit" name="action" value="list">List Revocations</button>
-      </div>
-    </form>
-
-    {% if revocations is defined and revocations %}
-      <h3 style="margin-top:20px;">Recent revocations</h3>
-      <table>
-        <thead><tr><th>License ID</th><th>Reason</th><th>Revoked At (UTC)</th><th>By</th></tr></thead>
-        <tbody>
-        {% for r in revocations %}
-          <tr>
-            <td>{{ r['license_id'] }}</td>
-            <td>{{ r['reason'] or '' }}</td>
-            <td>{{ r['revoked_at'] }}</td>
-            <td>{{ r['revoked_by'] or '' }}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-    {% endif %}
-    <p class="small">This admin page uses your ADMIN_KEY. Keep it secret. Calls made here are server-side and protected.</p>
-  </div>
-</body>
-</html>
+<h3>Search revocations</h3>
+<form method="get" action="{{ url_for('admin') }}">
+<label>license_id contains</label><input name="q" value="{{ request.args.get('q','') }}">
+<label>since (YYYY-MM-DD)</label><input name="since" value="{{ request.args.get('since','') }}">
+<button formaction="{{ url_for('admin') }}" formmethod="get">Search</button>
+<a href="{{ url_for('export_csv') }}">Download CSV</a> |
+<form method="post" action="{{ url_for('rotate_api_key') }}" style="display:inline;"><input type="hidden" name="admin_key" value="{{ request.args.get('admin_key','') }}"><button type="submit">Rotate API Key</button></form>
+<hr>
+{% if revocations %}
+  <table><thead><tr><th>License ID</th><th>Reason</th><th>Revoked At</th><th>By</th></tr></thead><tbody>
+  {% for r in revocations %}
+    <tr><td>{{ r['license_id'] }}</td><td>{{ r['reason'] }}</td><td>{{ r['revoked_at'] }}</td><td>{{ r['revoked_by'] }}</td></tr>
+  {% endfor %}</tbody></table>
+{% endif %}
+</div></body></html>
 """
 
 @app.route('/admin', methods=['GET'])
 def admin():
-    # render empty admin page (no revocations shown)
-    return render_template_string(ADMIN_HTML)
+    q = request.args.get('q','').strip()
+    since = request.args.get('since','').strip()
+    revs = []
+    sql = 'SELECT license_id, reason, revoked_at, revoked_by FROM revocations'
+    params = []
+    conds = []
+    if q:
+        conds.append("license_id LIKE ?")
+        params.append(f"%{q}%")
+    if since:
+        conds.append("date(revoked_at) >= date(?)")
+        params.append(since)
+    if conds:
+        sql += ' WHERE ' + ' AND '.join(conds)
+    sql += ' ORDER BY revoked_at DESC LIMIT 200'
+    with get_conn() as conn:
+        for r in conn.execute(sql, params):
+            revs.append(dict(r))
+    return render_template_string(ADMIN_HTML, revocations=revs)
 
 @app.route('/admin/action', methods=['POST'])
 def admin_action():
-    # this endpoint uses require_admin() to perform actions, but we need to extract admin_key first
-    # the require_admin decorator expects the key available via header/query/json/form, so form works
     action = request.form.get('action')
-    # validate admin key via decorator wrapper call manually for nicer flash behavior
     key = _get_admin_key_from_request()
     if not key or not hmac.compare_digest(key, ADMIN_KEY):
-        flash('Unauthorized: invalid ADMIN_KEY', 'error')
-        return redirect(url_for('admin'))
-
-    license_id = request.form.get('license_id')
+        flash('Unauthorized', 'error'); return redirect(url_for('admin'))
+    license_id = request.form.get('license_id') or ''
     reason = request.form.get('reason') or ''
-
     if action == 'revoke':
         now = datetime.now(timezone.utc)
         with get_conn() as conn:
             conn.execute('INSERT OR REPLACE INTO revocations (license_id, revoked_at, reason, revoked_by) VALUES (?,?,?,?)', (license_id, now, reason, 'web-admin'))
             conn.commit()
-        flash(f"Revoked {license_id}", 'ok')
-        return redirect(url_for('admin'))
-
+        log_activity('revoke', {'license_id': license_id, 'reason': reason})
+        notify_webhooks({'event':'revoke','license_id':license_id,'reason':reason,'revoked_at':now.isoformat()})
+        flash(f"Revoked {license_id}", 'ok'); return redirect(url_for('admin', admin_key=key))
     if action == 'unrevoke':
         with get_conn() as conn:
             conn.execute('DELETE FROM revocations WHERE license_id = ?', (license_id,))
             conn.commit()
-        flash(f"Unrevoked {license_id}", 'ok')
-        return redirect(url_for('admin'))
+        log_activity('unrevoke', {'license_id': license_id})
+        notify_webhooks({'event':'unrevoke','license_id':license_id})
+        flash(f"Unrevoked {license_id}", 'ok'); return redirect(url_for('admin', admin_key=key))
+    flash('Unknown action', 'error'); return redirect(url_for('admin'))
 
-    if action == 'list':
-        with get_conn() as conn:
-            rows = conn.execute('SELECT license_id, revoked_at, reason, revoked_by FROM revocations ORDER BY revoked_at DESC LIMIT 200').fetchall()
-        # convert rows to list of dicts for template
-        revs = [dict(r) for r in rows]
-        return render_template_string(ADMIN_HTML, revocations=revs)
+@app.route('/rotate_api_key', methods=['POST'])
+@require_admin
+def rotate_api_key_route():
+    return rotate_api_key()
 
-    flash('Unknown action', 'error')
-    return redirect(url_for('admin'))
-
-# ------------- Startup -------------
 if __name__ == '__main__':
     init_db()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
