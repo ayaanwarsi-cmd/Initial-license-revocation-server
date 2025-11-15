@@ -1,17 +1,15 @@
 # app.py
 """
-Full License Management & Revocation Server with Admin Login + Signing
-- Admin login + session cookie
-- Programmatic admin via X-API-KEY header (legacy/automation)
-- License CRUD: create, edit, suspend, revoke/unrevoke, sign
-- Quick "Revoke by ID" form on admin page
-- CSV export, activity logs, API key rotation
-- Server-side RSA signing (auto-generate keys if missing)
+License Management server — admin login + signing + revoke + signed-license downloads + dashboard
+- Admin UI: login, sign (auto-download), revoke quick form, signed-license list + download
+- Programmatic APIs: /sign, /revoke, /unrevoke
+- CSV export, API key rotation
+- Server-side RSA signing (uses cryptography)
 """
 
 from flask import (
     Flask, request, jsonify, render_template_string, redirect, url_for, flash,
-    send_file, session, make_response
+    send_file, session, make_response, abort
 )
 from functools import wraps
 import os, sqlite3, hmac, hashlib, json, csv, io, secrets, base64
@@ -28,16 +26,15 @@ try:
 except Exception:
     _HAS_CRYPTO = False
 
-# ---------------- Config (env overrideable) ----------------
+# -------- configuration (env overrideable) --------
 DB_PATH = os.environ.get("DB_PATH", "revocations.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "change_me")
 FLASK_SECRET = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
 API_KEY_HEADER = "X-API-KEY"
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # legacy header key for automation
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # legacy header admin key
 WEBHOOK_URLS = [u.strip() for u in (os.environ.get("WEBHOOK_URLS") or "").split(",") if u.strip()]
 
-# Signing key config
 PRIVATE_KEY_PATH = os.environ.get("PRIVATE_KEY_PATH", "server_private.pem")
 PUBLIC_KEY_PATH = os.environ.get("PUBLIC_KEY_PATH", "server_public.pem")
 SIGNED_DIR = os.environ.get("SIGNED_DIR", "signed_licenses")
@@ -45,21 +42,13 @@ SIGNED_DIR = os.environ.get("SIGNED_DIR", "signed_licenses")
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 
-# Ensure DB parent exists
+# Ensure directories exist
 _db_parent = Path(DB_PATH).parent
 if str(_db_parent) not in (".", "") and not _db_parent.exists():
-    try:
-        _db_parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+    _db_parent.mkdir(parents=True, exist_ok=True)
+Path(SIGNED_DIR).mkdir(parents=True, exist_ok=True)
 
-# Ensure signed_dir exists
-try:
-    Path(SIGNED_DIR).mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
-
-# ---------------- DB helpers ----------------
+# -------- DB helpers --------
 def get_conn():
     c = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
     c.row_factory = sqlite3.Row
@@ -113,13 +102,13 @@ def log_activity(event: str, details=None):
         else:
             raise
 
-# Init DB at import-time to avoid first-request 500
+# init DB at import-time
 try:
     init_db()
 except Exception:
     pass
 
-# ---------------- Auth helpers ----------------
+# -------- auth helpers --------
 _ADMIN_PASS_HASH = generate_password_hash(ADMIN_PASS)
 
 def _hash_key(k: str) -> str:
@@ -130,7 +119,6 @@ def is_api_admin():
     if header:
         if ADMIN_KEY and hmac.compare_digest(header, ADMIN_KEY):
             return True
-        # Support stored API keys (key_id)
         try:
             with get_conn() as conn:
                 row = conn.execute("SELECT key_hash, revoked FROM api_keys WHERE key_id = ?", (header,)).fetchone()
@@ -150,7 +138,7 @@ def login_required(fn):
         return redirect(url_for("login", next=request.path))
     return wrapper
 
-# ---------------- Utility ----------------
+# -------- utility --------
 def generate_readable_license_id(prefix="LIC"):
     now = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     rnd = secrets.token_hex(3).upper()
@@ -166,7 +154,7 @@ def notify_webhooks(payload: dict):
             except Exception:
                 pass
 
-# ---------------- Signing helpers ----------------
+# -------- signing helpers --------
 _private_key_obj = None
 _public_key_obj = None
 
@@ -175,7 +163,7 @@ def _ensure_private_key():
     if _private_key_obj is not None:
         return
     if not _HAS_CRYPTO:
-        raise RuntimeError("cryptography library not available; install it to enable signing")
+        raise RuntimeError("cryptography not available; install 'cryptography'")
     priv_path = Path(PRIVATE_KEY_PATH)
     pub_path = Path(PUBLIC_KEY_PATH)
     if priv_path.exists():
@@ -189,7 +177,7 @@ def _ensure_private_key():
         else:
             _public_key_obj = _private_key_obj.public_key()
         return
-    # Auto-generate if not present
+    # Auto-generate
     priv = rsa.generate_private_key(public_exponent=65537, key_size=4096)
     pem_priv = priv.private_bytes(encoding=serialization.Encoding.PEM,
                                  format=serialization.PrivateFormat.PKCS8,
@@ -217,7 +205,11 @@ def sign_license_object(lic_obj: dict) -> str:
     )
     return base64.b64encode(sig).decode("ascii")
 
-# ---------------- Public endpoints ----------------
+def _signed_file_path(license_id: str) -> Path:
+    safe = "".join(c for c in license_id if c.isalnum() or c in "-_.")
+    return Path(SIGNED_DIR) / f"{safe}.json"
+
+# -------- public endpoints --------
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
@@ -233,7 +225,7 @@ def status(license_id):
                         "reason": row["revoked_reason"], "server_time": now})
     return jsonify({"revoked": False, "suspended": False, "license_id": license_id, "server_time": now})
 
-# ---------------- Programmatic admin API ----------------
+# -------- programmatic admin APIs --------
 @app.route("/revoke", methods=["POST"])
 def revoke_api():
     if not (session.get("admin_authenticated") or is_api_admin()):
@@ -272,7 +264,7 @@ def unrevoke_api():
     notify_webhooks({"event": "unrevoke", "license_id": lid, "by": by, "time": datetime.now(timezone.utc).isoformat()})
     return jsonify({"revoked": False, "license_id": lid})
 
-# ---------------- Signing API ----------------
+# -------- signing programmatic API --------
 @app.route("/sign", methods=["POST"])
 def sign_api():
     if not (session.get("admin_authenticated") or is_api_admin()):
@@ -291,7 +283,7 @@ def sign_api():
         sig = sign_license_object(lic)
     except Exception as e:
         return jsonify({"error": f"signing failed: {e}"}), 500
-    # Save into licenses table as active
+    # save license row
     try:
         with get_conn() as conn:
             conn.execute("INSERT OR REPLACE INTO licenses (license_id, hwid, email, created_at, expiry, features, status) VALUES (?,?,?,?,?,?,?)",
@@ -300,9 +292,57 @@ def sign_api():
     except Exception:
         pass
     log_activity("sign", {"license_id": lid, "by": session.get("admin_user") or "api"})
+    # support optional "save" flag in JSON to write file to SIGNED_DIR
+    if data.get("save") in (True, "true", "1", 1):
+        out_path = _signed_file_path(lid)
+        out_obj = {"license": lic, "signature": sig}
+        out_path.write_text(json.dumps(out_obj, indent=2, ensure_ascii=False), encoding="utf-8")
     return jsonify({"license": lic, "signature": sig})
 
-# ---------------- Admin UI templates (dark + quick revoke form) ----------------
+# -------- signed file download (UI + API) --------
+@app.route("/signed/download/<license_id>", methods=["GET"])
+@login_required
+def signed_download(license_id):
+    """
+    If a file exists in SIGNED_DIR, serve it.
+    Otherwise regenerate signed JSON from DB and stream it (no persistent file).
+    """
+    path = _signed_file_path(license_id)
+    if path.exists():
+        return send_file(str(path), mimetype="application/json", as_attachment=True, download_name=path.name)
+    # Regenerate from DB
+    with get_conn() as conn:
+        row = conn.execute("SELECT license_id, hwid, email, created_at, expiry, features FROM licenses WHERE license_id = ?", (license_id,)).fetchone()
+    if not row:
+        return abort(404, "license not found")
+    features = row["features"]
+    try:
+        feats = json.loads(features) if features and isinstance(features, str) else features
+    except Exception:
+        feats = features
+    lic = {
+        "id": row["license_id"],
+        "hwid": row["hwid"],
+        "email": row["email"],
+        "created_at": row["created_at"],
+        "expiry": row["expiry"],
+        "features": feats
+    }
+    if not _HAS_CRYPTO:
+        # return unsigned if no crypto available
+        return jsonify({"license": lic})
+    try:
+        sig = sign_license_object(lic)
+    except Exception as e:
+        return abort(500, f"signing failed: {e}")
+    out = {"license": lic, "signature": sig}
+    data = json.dumps(out, indent=2, ensure_ascii=False)
+    resp = make_response(data)
+    resp.headers["Content-Type"] = "application/json"
+    resp.headers["Content-Disposition"] = f"attachment; filename={license_id}.json"
+    return resp
+
+# -------- admin UI templates (login, dashboard with signed table, sign form) --------
 _LOGIN_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Admin login</title>
 <style>body{background:#0b0f12;color:#d6e6f0;font-family:Inter,Segoe UI,Roboto,Arial;margin:0}
@@ -325,25 +365,26 @@ button{margin-top:16px;padding:10px 12px;border-radius:8px;border:0;background:#
 </body></html>
 """
 
-_ADMIN_SIMPLE = """
+_ADMIN_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Admin Dashboard</title>
-<style>body{background:#071018;color:#e6f3ff;font-family:Inter,Arial;padding:12px} a{color:#9fd}
+<style>
+body{background:#071018;color:#e6f3ff;font-family:Inter,Arial;padding:12px} a{color:#9fd}
 .header{display:flex;justify-content:space-between;align-items:center}
+.controls{display:flex;gap:8px}
+.btn{background:#17a2ff;color:#001;border:0;padding:8px 10px;border-radius:8px;cursor:pointer}
 .quick{background:#08121a;padding:12px;border-radius:8px;margin:12px 0}
 .input{padding:8px;border-radius:6px;border:1px solid #123;background:#03121a;color:#dff;width:100%}
-.row{display:flex;gap:8px}
-.btn{background:#17a2ff;color:#001;border:0;padding:8px 10px;border-radius:8px;cursor:pointer}
-.small{color:#9fb2c8}
 .card{background:#08121a;padding:12px;border-radius:10px;margin-top:12px}
 .table{width:100%;border-collapse:collapse;margin-top:8px}
 .table th,.table td{padding:8px;border-bottom:1px solid #0b394f;text-align:left}
+.small{color:#9fb2c8}
 </style></head><body>
 <div class="header">
-  <div><strong>Admin</strong></div>
-  <div>
-    <a href="{{ url_for('admin_sign') }}">Sign license</a> |
-    <a href="{{ url_for('export_csv') }}">Export CSV</a> |
-    <a href="{{ url_for('logout') }}">Logout</a>
+  <div><strong>License Management — Admin</strong></div>
+  <div class="controls">
+    <a class="btn" href="{{ url_for('export_csv') }}">Export CSV</a>
+    <form method="post" action="{{ url_for('rotate_api_key_route') }}" style="display:inline"><button class="btn">Rotate API Key</button></form>
+    <a class="btn" href="{{ url_for('logout') }}" style="background:#ff6b6b">Logout</a>
   </div>
 </div>
 
@@ -351,22 +392,50 @@ _ADMIN_SIMPLE = """
   <form method="post" action="{{ url_for('admin_revoke') }}">
     <div style="display:flex;gap:8px;align-items:center">
       <div style="flex:1">
-        <label class="small">Revoke license (enter exact License ID)</label>
+        <label class="small">Revoke license (enter exact ID)</label>
         <input name="license_id" class="input" placeholder="LIC-20251115-152911-ZS9CFZ" required>
       </div>
       <div style="width:280px">
         <label class="small">Reason (optional)</label>
         <input name="reason" class="input" placeholder="e.g. fraud detected">
       </div>
-      <div style="width:120px">
-        <label class="small">&nbsp;</label>
-        <button class="btn" type="submit" style="background:#ff6b6b">Revoke</button>
-      </div>
+      <div style="width:120px"><label class="small">&nbsp;</label><button class="btn" type="submit" style="background:#ff6b6b">Revoke</button></div>
     </div>
   </form>
 </div>
 
 <div class="card">
+  <h3>Signed licenses</h3>
+  <div class="small">List of licenses (from database). Click Download to get the signed license JSON (served from server or generated on-the-fly).</div>
+  {% if licenses %}
+  <table class="table">
+    <thead><tr><th>License ID</th><th>Email</th><th>HWID</th><th>Expiry</th><th>Status</th><th>Signed file</th></tr></thead>
+    <tbody>
+      {% for L in licenses %}
+      <tr>
+        <td><code>{{ L.license_id }}</code></td>
+        <td>{{ L.email or '-' }}</td>
+        <td>{{ L.hwid or '-' }}</td>
+        <td>{{ L.expiry or '-' }}</td>
+        <td>{{ L.status }}</td>
+        <td>
+          <a class="btn" href="{{ url_for('signed_download', license_id=L.license_id) }}">Download</a>
+          {% if L.file_exists %}
+            <span class="small">saved</span>
+          {% else %}
+            <span class="small">generated</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <div class="small">No licenses found.</div>
+  {% endif %}
+</div>
+
+<div class="card" style="margin-top:12px">
   <h3>Recent activity</h3>
   {% if activity %}
   <table class="table">
@@ -410,13 +479,12 @@ body{background:#071018;color:#e6f3ff;font-family:Inter,Arial;padding:12px}
 </body></html>
 """
 
-# ---------------- Admin routes ----------------
+# -------- admin routes --------
 @app.route("/admin/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
         u = request.form.get("username", "")
         p = request.form.get("password", "")
-        # Accept either hashed-check or direct match fallback (compat)
         if u == ADMIN_USER and (check_password_hash(_ADMIN_PASS_HASH, p) or p == ADMIN_PASS):
             session["admin_authenticated"] = True
             session["admin_user"] = u
@@ -432,9 +500,34 @@ def logout():
 @app.route("/admin", methods=["GET"])
 @login_required
 def admin():
+    q = request.args.get("q", "").strip()
+    status_filter = request.args.get("status", "").strip()
+    params = []
+    sql = "SELECT license_id, hwid, email, expiry, status FROM licenses"
+    conds = []
+    if q:
+        conds.append("(license_id LIKE ? OR email LIKE ? OR hwid LIKE ?)")
+        params.extend([f"%{q}%"]*3)
+    if status_filter:
+        conds.append("status = ?"); params.append(status_filter)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY created_at DESC LIMIT 200"
+    licenses = []
     with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        for r in rows:
+            path = _signed_file_path(r["license_id"])
+            licenses.append({
+                "license_id": r["license_id"],
+                "hwid": r["hwid"],
+                "email": r["email"],
+                "expiry": r["expiry"],
+                "status": r["status"],
+                "file_exists": path.exists()
+            })
         activity = conn.execute("SELECT ts, event, details FROM activity_logs ORDER BY ts DESC LIMIT 40").fetchall()
-    return render_template_string(_ADMIN_SIMPLE, activity=activity)
+    return render_template_string(_ADMIN_HTML, licenses=licenses, activity=activity)
 
 @app.route("/admin/sign", methods=["GET", "POST"])
 @login_required
@@ -450,20 +543,18 @@ def admin_sign():
         try:
             feats_parsed = json.loads(feats)
         except Exception:
-            flash("Features must be valid JSON")
-            return redirect(url_for("admin_sign"))
+            flash("Features must be valid JSON"); return redirect(url_for("admin_sign"))
     else:
         feats_parsed = {"pro": True}
     now = datetime.now(timezone.utc).isoformat()
     lic = {"id": lid, "hwid": hwid, "email": email, "created_at": now, "expiry": expiry, "features": feats_parsed}
     if not _HAS_CRYPTO:
-        flash("Server missing cryptography; cannot sign.")
-        return redirect(url_for("admin"))
+        flash("Server missing cryptography; cannot sign."); return redirect(url_for("admin"))
     try:
         sig = sign_license_object(lic)
     except Exception as e:
-        flash(f"Signing failed: {e}")
-        return redirect(url_for("admin"))
+        flash(f"Signing failed: {e}"); return redirect(url_for("admin"))
+    # save row
     try:
         with get_conn() as conn:
             conn.execute("INSERT OR REPLACE INTO licenses (license_id, hwid, email, created_at, expiry, features, status) VALUES (?,?,?,?,?,?,?)",
@@ -472,18 +563,17 @@ def admin_sign():
     except Exception:
         pass
     log_activity("sign", {"license_id": lid, "by": session.get("admin_user")})
+    # Save file if requested
     if request.form.get("save") == "yes":
-        out_path = Path(SIGNED_DIR) / f"{lid}.json"
+        out_path = _signed_file_path(lid)
         out_obj = {"license": lic, "signature": sig}
         out_path.write_text(json.dumps(out_obj, indent=2, ensure_ascii=False), encoding="utf-8")
-        flash(f"Signed and saved to {out_path}")
-        resp = make_response(json.dumps(out_obj, indent=2, ensure_ascii=False))
-        resp.headers["Content-Type"] = "application/json"
-        resp.headers["Content-Disposition"] = f"attachment; filename={lid}.json"
-        return resp
+        # Immediately serve the file as a download (auto-download)
+        return redirect(url_for("signed_download", license_id=lid))
+    # Otherwise return JSON in browser
     return jsonify({"license": lic, "signature": sig})
 
-# ---------------- Quick revoke route (from admin form) ----------------
+# quick revoke route
 @app.route("/admin/revoke", methods=["POST"])
 @login_required
 def admin_revoke():
@@ -492,7 +582,6 @@ def admin_revoke():
     if not license_id:
         flash("License ID required", "error")
         return redirect(url_for("admin"))
-
     now = datetime.now(timezone.utc)
     try:
         with get_conn() as conn:
@@ -506,7 +595,6 @@ def admin_revoke():
         log_activity("revoke_error", {"license_id": license_id, "error": str(e)})
         flash(f"Failed to revoke: {e}", "error")
         return redirect(url_for("admin"))
-
     try:
         log_activity("revoke", {"license_id": license_id, "reason": reason, "by": session.get("admin_user")})
     except Exception:
@@ -515,11 +603,10 @@ def admin_revoke():
         notify_webhooks({"event": "revoke", "license_id": license_id, "reason": reason, "revoked_at": now.isoformat()})
     except Exception:
         pass
-
     flash(f"Revoked {license_id}", "ok")
     return redirect(url_for("admin"))
 
-# ---------------- Other admin operations (rotate key, export, create/edit/suspend) ----------------
+# rotate API key + export CSV
 @app.route("/api/keys/rotate", methods=["POST"])
 @login_required
 def rotate_api_key_route():
@@ -552,12 +639,8 @@ def export_csv():
     sio.seek(0)
     return send_file(io.BytesIO(sio.getvalue().encode("utf-8")), mimetype="text/csv", download_name="licenses_activity.csv", as_attachment=True)
 
-# Additional admin license routes (create/edit/suspend/unsuspend) could be added similarly.
-# For brevity, the UI currently focuses on quick revoke + sign. You can re-add full CRUD UI if desired.
-
-# ---------------- Run ----------------
+# -------- run server --------
 if __name__ == "__main__":
-    # ensure signing key if cryptography available
     if _HAS_CRYPTO:
         try:
             _ensure_private_key()
