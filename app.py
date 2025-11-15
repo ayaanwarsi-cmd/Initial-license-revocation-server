@@ -4,6 +4,7 @@ from functools import wraps
 import os, sqlite3, hmac, hashlib, json, csv, io, secrets, base64, time
 from datetime import datetime, timezone
 import requests
+from pathlib import Path
 
 DB_PATH = os.environ.get('DB_PATH', 'revocations.db')
 ADMIN_KEY = os.environ.get('ADMIN_KEY', None) or 'CHANGE_ME'  # rotate via UI
@@ -13,13 +14,27 @@ WEBHOOK_URLS = [u.strip() for u in (os.environ.get('WEBHOOK_URLS') or '').split(
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', secrets.token_hex(16))
 
+# Ensure DB location directory exists (if DB_PATH contains directories)
+_db_parent = Path(DB_PATH).parent
+if str(_db_parent) not in ('.', '') and not _db_parent.exists():
+    try:
+        _db_parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # ignore: maybe using relative path
+        pass
+
 # ---------- DB ----------
 def get_conn():
+    # Each call returns a fresh sqlite3 connection (safe per-thread)
     c = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
     c.row_factory = sqlite3.Row
     return c
 
 def init_db():
+    """
+    Create required tables if they don't exist.
+    Safe to call multiple times.
+    """
     with get_conn() as conn:
         conn.executescript('''
         CREATE TABLE IF NOT EXISTS revocations (
@@ -46,10 +61,29 @@ def init_db():
         conn.commit()
 
 def log_activity(event: str, details: dict | str = None):
-    with get_conn() as conn:
-        conn.execute('INSERT INTO activity_logs (ts, event, details) VALUES (?,?,?)',
-                     (datetime.now(timezone.utc), event, json.dumps(details) if details is not None else None))
-        conn.commit()
+    """
+    Write an activity log. If the table is missing (OperationalError),
+    attempt to init_db() and retry once rather than crashing the request.
+    """
+    try:
+        with get_conn() as conn:
+            conn.execute('INSERT INTO activity_logs (ts, event, details) VALUES (?,?,?)',
+                         (datetime.now(timezone.utc), event, json.dumps(details) if details is not None else None))
+            conn.commit()
+    except sqlite3.OperationalError as e:
+        # If missing table or DB not initialized, try to create schema and retry once
+        if 'no such table' in str(e).lower():
+            try:
+                init_db()
+                with get_conn() as conn:
+                    conn.execute('INSERT INTO activity_logs (ts, event, details) VALUES (?,?,?)',
+                                 (datetime.now(timezone.utc), event, json.dumps(details) if details is not None else None))
+                    conn.commit()
+                return
+            except Exception:
+                # fall through to raising the original error below
+                pass
+        raise
 
 # ---------- admin auth ----------
 def _get_admin_key_from_request():
@@ -87,8 +121,11 @@ def notify_webhooks(payload: dict):
         try:
             requests.post(url, json=payload, timeout=5)
         except Exception:
-            # swallow — logging in DB
-            log_activity('webhook_failed', {'url': url, 'payload': payload})
+            # swallow — log in DB
+            try:
+                log_activity('webhook_failed', {'url': url, 'payload': payload})
+            except Exception:
+                pass
 
 # ---------- API ----------
 @app.route('/health')
@@ -114,8 +151,16 @@ def revoke():
         conn.execute('INSERT OR REPLACE INTO revocations (license_id, revoked_at, reason, revoked_by) VALUES (?,?,?,?)',
                      (lid, now, reason, by))
         conn.commit()
-    log_activity('revoke', {'license_id': lid, 'reason': reason, 'by': by})
-    notify_webhooks({'event': 'revoke', 'license_id': lid, 'reason': reason, 'revoked_at': now.isoformat()})
+    # log and webhook (resilient)
+    try:
+        log_activity('revoke', {'license_id': lid, 'reason': reason, 'by': by})
+    except Exception:
+        # don't make API fail because logging failed
+        pass
+    try:
+        notify_webhooks({'event': 'revoke', 'license_id': lid, 'reason': reason, 'revoked_at': now.isoformat()})
+    except Exception:
+        pass
     return jsonify({'revoked': True, 'license_id': lid, 'revoked_at': now.isoformat(), 'reason': reason})
 
 @app.route('/unrevoke', methods=['POST'])
@@ -129,8 +174,14 @@ def unrevoke():
     with get_conn() as conn:
         conn.execute('DELETE FROM revocations WHERE license_id = ?', (lid,))
         conn.commit()
-    log_activity('unrevoke', {'license_id': lid, 'by': by})
-    notify_webhooks({'event': 'unrevoke', 'license_id': lid, 'by': by, 'time': datetime.now(timezone.utc).isoformat()})
+    try:
+        log_activity('unrevoke', {'license_id': lid, 'by': by})
+    except Exception:
+        pass
+    try:
+        notify_webhooks({'event': 'unrevoke', 'license_id': lid, 'by': by, 'time': datetime.now(timezone.utc).isoformat()})
+    except Exception:
+        pass
     return jsonify({'revoked': False, 'license_id': lid})
 
 @app.route('/status/<license_id>')
@@ -148,7 +199,7 @@ def _hash_key(k: str) -> str:
 
 @app.route('/api/keys/rotate', methods=['POST'])
 @require_admin
-def rotate_api_key():
+def rotate_api_key_route():
     # generate new key and store hash; return plaintext once
     new_key = secrets.token_hex(32)
     key_id = secrets.token_hex(8)
@@ -156,13 +207,15 @@ def rotate_api_key():
     with get_conn() as conn:
         conn.execute('INSERT INTO api_keys (key_id, key_hash, created_at, revoked) VALUES (?,?,?,0)', (key_id, _hash_key(new_key), now))
         conn.commit()
-    log_activity('api_key_rotated', {'key_id': key_id})
+    try:
+        log_activity('api_key_rotated', {'key_id': key_id})
+    except Exception:
+        pass
     return jsonify({'key_id': key_id, 'key': new_key})
 
 @app.route('/admin/export.csv')
 @require_admin
 def export_csv():
-    # export revocations and activity logs as CSV (combined in separate tabs -> send as CSV with two sections)
     sio = io.StringIO()
     w = csv.writer(sio)
     w.writerow(['revocations'])
@@ -246,23 +299,25 @@ def admin_action():
         with get_conn() as conn:
             conn.execute('INSERT OR REPLACE INTO revocations (license_id, revoked_at, reason, revoked_by) VALUES (?,?,?,?)', (license_id, now, reason, 'web-admin'))
             conn.commit()
-        log_activity('revoke', {'license_id': license_id, 'reason': reason})
-        notify_webhooks({'event':'revoke','license_id':license_id,'reason':reason,'revoked_at':now.isoformat()})
+        try:
+            log_activity('revoke', {'license_id': license_id, 'reason': reason})
+        except Exception:
+            pass
+        try:
+            notify_webhooks({'event':'revoke','license_id':license_id,'reason':reason,'revoked_at':now.isoformat()})
+        except Exception:
+            pass
         flash(f"Revoked {license_id}", 'ok'); return redirect(url_for('admin', admin_key=key))
     if action == 'unrevoke':
         with get_conn() as conn:
             conn.execute('DELETE FROM revocations WHERE license_id = ?', (license_id,))
             conn.commit()
-        log_activity('unrevoke', {'license_id': license_id})
-        notify_webhooks({'event':'unrevoke','license_id':license_id})
-        flash(f"Unrevoked {license_id}", 'ok'); return redirect(url_for('admin', admin_key=key))
-    flash('Unknown action', 'error'); return redirect(url_for('admin'))
-
-@app.route('/rotate_api_key', methods=['POST'])
-@require_admin
-def rotate_api_key_route():
-    return rotate_api_key()
-
-if __name__ == '__main__':
-    init_db()
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+        try:
+            log_activity('unrevoke', {'license_id': license_id})
+        except Exception:
+            pass
+        try:
+            notify_webhooks({'event':'unrevoke','license_id':license_id})
+        except Exception:
+            pass
+        flash(f"Unrevo...
