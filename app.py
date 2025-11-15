@@ -14,13 +14,12 @@ WEBHOOK_URLS = [u.strip() for u in (os.environ.get('WEBHOOK_URLS') or '').split(
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', secrets.token_hex(16))
 
-# Ensure DB location directory exists (if DB_PATH contains directories)
+# Ensure DB directory exists (if DB_PATH contains folders)
 _db_parent = Path(DB_PATH).parent
 if str(_db_parent) not in ('.', '') and not _db_parent.exists():
     try:
         _db_parent.mkdir(parents=True, exist_ok=True)
     except Exception:
-        # ignore: maybe using relative path
         pass
 
 # ---------- DB ----------
@@ -84,6 +83,13 @@ def log_activity(event: str, details: dict | str = None):
                 # fall through to raising the original error below
                 pass
         raise
+
+# Initialize DB at import time to avoid "no such table" on first requests
+try:
+    init_db()
+except Exception:
+    # if init fails, we still let app start and try again at runtime
+    pass
 
 # ---------- admin auth ----------
 def _get_admin_key_from_request():
@@ -155,7 +161,6 @@ def revoke():
     try:
         log_activity('revoke', {'license_id': lid, 'reason': reason, 'by': by})
     except Exception:
-        # don't make API fail because logging failed
         pass
     try:
         notify_webhooks({'event': 'revoke', 'license_id': lid, 'reason': reason, 'revoked_at': now.isoformat()})
@@ -320,4 +325,10 @@ def admin_action():
             notify_webhooks({'event':'unrevoke','license_id':license_id})
         except Exception:
             pass
-        flash(f"Unrevo...
+        flash(f"Unrevoked {license_id}", 'ok'); return redirect(url_for('admin', admin_key=key))
+    flash('Unknown action', 'error'); return redirect(url_for('admin'))
+
+if __name__ == '__main__':
+    # When run directly, ensure DB exists and start Flask for local debugging.
+    init_db()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
