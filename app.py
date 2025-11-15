@@ -218,6 +218,12 @@ def rotate_api_key_route():
         pass
     return jsonify({'key_id': key_id, 'key': new_key})
 
+# alias route for templates/calls that expect 'rotate_api_key' endpoint name
+@app.route('/api/keys/rotate-alias', methods=['POST'])
+@require_admin
+def rotate_api_key():
+    return rotate_api_key_route()
+
 @app.route('/admin/export.csv')
 @require_admin
 def export_csv():
@@ -238,6 +244,7 @@ def export_csv():
     return send_file(io.BytesIO(sio.getvalue().encode('utf-8')), mimetype='text/csv', download_name='revocations_activity.csv', as_attachment=True)
 
 # ---------- Admin UI ----------
+# NOTE: template uses rotate_api_key_route (the canonical route). Kept alias above for compatibility.
 ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Admin</title>
 <style>body{font-family:Arial;background:#071018;color:#dfe;} .card{max-width:980px;margin:24px auto;padding:18px;background:#08121a;border-radius:8px} input,textarea,select{width:100%;padding:8px;margin:6px 0;border-radius:6px;background:#02121a;color:#dfe;border:1px solid #233} table{width:100%;border-collapse:collapse;margin-top:12px}th,td{padding:8px;border-bottom:1px solid #123;text-align:left}</style>
 </head><body><div class="card">
@@ -258,7 +265,7 @@ ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Admin</t
 <label>since (YYYY-MM-DD)</label><input name="since" value="{{ request.args.get('since','') }}">
 <button formaction="{{ url_for('admin') }}" formmethod="get">Search</button>
 <a href="{{ url_for('export_csv') }}">Download CSV</a> |
-<form method="post" action="{{ url_for('rotate_api_key') }}" style="display:inline;"><input type="hidden" name="admin_key" value="{{ request.args.get('admin_key','') }}"><button type="submit">Rotate API Key</button></form>
+<form method="post" action="{{ url_for('rotate_api_key_route') }}" style="display:inline;"><input type="hidden" name="admin_key" value="{{ request.args.get('admin_key','') }}"><button type="submit">Rotate API Key</button></form>
 <hr>
 {% if revocations %}
   <table><thead><tr><th>License ID</th><th>Reason</th><th>Revoked At</th><th>By</th></tr></thead><tbody>
