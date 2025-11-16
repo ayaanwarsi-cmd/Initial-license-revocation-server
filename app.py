@@ -9,14 +9,17 @@ License Management Server — Admin UI restricted to Revoke-only feature.
     - view revoked licenses list
     - recent activity log
 All endpoints remain protected by admin session or X-API-KEY header where applicable.
-"""
 
+New: persistent revoked.txt support (REVOKED_FILE). When a license is revoked it is
+persisted to REVOKED_FILE (atomic write). GET /status/<license_id> consults both DB
+and revoked file so revoked licenses won't become "active" again if re-inserted into DB.
+"""
 from flask import (
     Flask, request, jsonify, render_template_string, redirect, url_for, flash,
     send_file, session, make_response, abort
 )
 from functools import wraps
-import os, sqlite3, hmac, hashlib, json, csv, io, secrets, base64
+import os, sqlite3, hmac, hashlib, json, csv, io, secrets, base64, threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 import requests
@@ -42,6 +45,13 @@ WEBHOOK_URLS = [u.strip() for u in (os.environ.get("WEBHOOK_URLS") or "").split(
 PRIVATE_KEY_PATH = os.environ.get("PRIVATE_KEY_PATH", "server_private.pem")
 PUBLIC_KEY_PATH = os.environ.get("PUBLIC_KEY_PATH", "server_public.pem")
 SIGNED_DIR = os.environ.get("SIGNED_DIR", "signed_licenses")
+
+# New revoked file config
+REVOKED_FILE = os.environ.get("REVOKED_FILE", "revoked.txt")
+# If true will sync DB revoked rows into the revoked file at startup (default True)
+REVOKED_FILE_SYNC_DB = os.environ.get("REVOKED_FILE_SYNC_DB", "1") not in ("0", "false", "False")
+# Optional max lines to load/display
+REVOKED_FILE_MAX = int(os.environ.get("REVOKED_FILE_MAX", "5000"))
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
@@ -111,6 +121,122 @@ try:
     init_db()
 except Exception:
     pass
+
+# ---------------- revoked.txt helpers ----------------
+# In-memory map of revoked IDs -> metadata dict {"when": iso, "reason": str, "by": str}
+_REVOKE_LOCK = threading.Lock()
+_revoked_file_map: dict = {}
+
+def _now_iso():
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def _load_revoked_file():
+    """Load REVOKED_FILE into _revoked_file_map. Supports JSON-lines or plaintext IDs."""
+    global _revoked_file_map
+    with _REVOKE_LOCK:
+        _revoked_file_map = {}
+        try:
+            p = Path(REVOKED_FILE)
+            if not p.exists():
+                return
+            with p.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        if line.startswith("{"):
+                            obj = json.loads(line)
+                            lid = str(obj.get("id") or obj.get("license_id") or obj.get("license"))
+                            if not lid:
+                                continue
+                            _revoked_file_map[lid] = {
+                                "when": obj.get("when") or obj.get("revoked_at") or _now_iso(),
+                                "reason": obj.get("reason") or obj.get("revoked_reason") or "",
+                                "by": obj.get("by") or obj.get("revoked_by") or ""
+                            }
+                        else:
+                            # plain ID
+                            lid = line
+                            if lid not in _revoked_file_map:
+                                _revoked_file_map[lid] = {"when": None, "reason": "", "by": ""}
+                    except Exception:
+                        # skip bad lines
+                        continue
+        except Exception:
+            # If file read fails, keep map empty
+            _revoked_file_map = {}
+            return
+
+def _persist_revoked_file():
+    """Atomically write _revoked_file_map to REVOKED_FILE as JSON-lines."""
+    with _REVOKE_LOCK:
+        tmp = REVOKED_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for lid, info in list(_revoked_file_map.items())[:REVOKED_FILE_MAX]:
+                    obj = {"id": lid, "when": info.get("when") or _now_iso(), "reason": info.get("reason") or "", "by": info.get("by") or ""}
+                    fh.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n")
+            os.replace(tmp, REVOKED_FILE)
+        except Exception as e:
+            # log to activity logs
+            try:
+                log_activity("revoked_file_write_error", {"error": str(e)})
+            except Exception:
+                pass
+
+def _add_to_revoked_file(license_id: str, reason: str = "", by: str = ""):
+    """Add a license id to in-memory revoked map and persist to file."""
+    lid = str(license_id)
+    with _REVOKE_LOCK:
+        existing = _revoked_file_map.get(lid)
+        if existing:
+            # update reason/by/when if more specific
+            existing["reason"] = reason or existing.get("reason", "")
+            existing["by"] = by or existing.get("by", "")
+            if not existing.get("when"):
+                existing["when"] = _now_iso()
+        else:
+            _revoked_file_map[lid] = {"when": _now_iso(), "reason": reason or "", "by": by or ""}
+    _persist_revoked_file()
+
+def _remove_from_revoked_file(license_id: str):
+    lid = str(license_id)
+    with _REVOKE_LOCK:
+        removed = _revoked_file_map.pop(lid, None)
+    _persist_revoked_file()
+    return bool(removed)
+
+def _is_in_revoked_file(license_id: str) -> bool:
+    with _REVOKE_LOCK:
+        return str(license_id) in _revoked_file_map
+
+def _revoked_file_entries(limit: int = 200):
+    with _REVOKE_LOCK:
+        items = list(_revoked_file_map.items())[:limit]
+    return [{"license_id": k, "when": v.get("when"), "reason": v.get("reason"), "by": v.get("by")} for k, v in items]
+
+# Initial load of revoked file
+try:
+    _load_revoked_file()
+except Exception:
+    _revoked_file_map = {}
+
+# Optional: sync DB revoked rows into revoked file on startup to ensure persistence
+if REVOKED_FILE_SYNC_DB:
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT license_id, revoked_at, revoked_reason, revoked_by FROM licenses WHERE status='revoked'").fetchall()
+            for r in rows:
+                lid = r["license_id"]
+                if not _is_in_revoked_file(lid):
+                    _add_to_revoked_file(lid, reason=(r["revoked_reason"] or ""), by=(r["revoked_by"] or "db"))
+    except Exception:
+        # log and continue
+        try:
+            log_activity("revoked_file_sync_error", {"error": "db sync failed"})
+        except Exception:
+            pass
 
 # ---------------- Auth ----------------
 _ADMIN_PASS_HASH = generate_password_hash(ADMIN_PASS)
@@ -220,12 +346,33 @@ def health():
 @app.route("/status/<license_id>")
 def status(license_id):
     now = datetime.now(timezone.utc).isoformat()
-    with get_conn() as conn:
-        row = conn.execute("SELECT license_id, status, revoked_at, revoked_reason, expiry FROM licenses WHERE license_id = ?", (license_id,)).fetchone()
+    # First consult DB
+    row = None
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT license_id, status, revoked_at, revoked_reason, expiry FROM licenses WHERE license_id = ?", (license_id,)).fetchone()
+    except Exception:
+        row = None
+
+    # If DB says revoked, that's definitive
+    if row and row["status"] == "revoked":
+        return jsonify({"revoked": True, "suspended": False, "license_id": row["license_id"],
+                        "revoked_at": row["revoked_at"], "reason": row["revoked_reason"], "expiry": row["expiry"], "server_time": now})
+
+    # If DB not revoked, still consult revoked.txt — it is authoritative for persisted revocations
+    if _is_in_revoked_file(license_id):
+        entry = None
+        with _REVOKE_LOCK:
+            entry = _revoked_file_map.get(str(license_id))
+        return jsonify({"revoked": True, "suspended": False, "license_id": license_id,
+                        "revoked_at": entry.get("when") if entry else None,
+                        "reason": entry.get("reason") if entry else None,
+                        "expiry": row["expiry"] if row else None,
+                        "server_time": now})
+
+    # Not revoked
     if row:
-        return jsonify({"revoked": row["status"] == "revoked", "suspended": row["status"] == "suspended",
-                        "license_id": row["license_id"], "revoked_at": row["revoked_at"],
-                        "reason": row["revoked_reason"], "expiry": row["expiry"], "server_time": now})
+        return jsonify({"revoked": False, "suspended": row["status"] == "suspended", "license_id": row["license_id"], "revoked_at": row["revoked_at"], "reason": row["revoked_reason"], "expiry": row["expiry"], "server_time": now})
     return jsonify({"revoked": False, "suspended": False, "license_id": license_id, "server_time": now})
 
 # ---------------- API: list / create / revoke licenses ----------------
@@ -293,6 +440,7 @@ def api_license_revoke(license_id):
     reason = data.get("reason") or request.form.get("reason") or "revoked via API"
     by = session.get("admin_user") or "api"
     now = datetime.now(timezone.utc)
+    # Update DB (insert-or-update)
     try:
         with get_conn() as conn:
             conn.execute("""
@@ -304,6 +452,13 @@ def api_license_revoke(license_id):
     except Exception as e:
         log_activity("revoke_error", {"license_id": license_id, "error": str(e)})
         return jsonify({"error": str(e)}), 500
+
+    # Persist into revoked.txt as authoritative
+    try:
+        _add_to_revoked_file(license_id, reason=reason, by=by)
+    except Exception as e:
+        log_activity("revoked_file_add_error", {"license_id": license_id, "error": str(e)})
+
     log_activity("revoke", {"license_id": license_id, "reason": reason, "by": by})
     notify_webhooks({"event": "revoke", "license_id": license_id, "reason": reason, "revoked_at": now.isoformat()})
     return jsonify({"revoked": True, "license_id": license_id, "reason": reason})
@@ -466,7 +621,7 @@ body{background:#071018;color:#e6f3ff;font-family:Inter,Arial;padding:12px} a{co
 </div>
 
 <div class="card" style="margin-top:12px">
-  <h3>Revoked licenses (recent)</h3>
+  <h3>Revoked licenses (recent from DB)</h3>
   {% if revoked %}
     <table class="table"><thead><tr><th>ID</th><th>Revoked At</th><th>Reason</th><th>By</th></tr></thead>
     <tbody>
@@ -476,6 +631,20 @@ body{background:#071018;color:#e6f3ff;font-family:Inter,Arial;padding:12px} a{co
     </tbody></table>
   {% else %}
     <div class="small">No revoked licenses found.</div>
+  {% endif %}
+</div>
+
+<div class="card" style="margin-top:12px">
+  <h3>Revoked file entries (revoked.txt)</h3>
+  {% if revoked_file %}
+    <table class="table"><thead><tr><th>ID</th><th>When</th><th>Reason</th><th>By</th></tr></thead>
+    <tbody>
+      {% for R in revoked_file %}
+        <tr><td><code>{{ R.license_id }}</code></td><td>{{ R.when or '-' }}</td><td>{{ R.reason or '-' }}</td><td>{{ R.by or '-' }}</td></tr>
+      {% endfor %}
+    </tbody></table>
+  {% else %}
+    <div class="small">No revoked file entries found.</div>
   {% endif %}
 </div>
 
@@ -545,12 +714,16 @@ def admin():
                 "expiry": r["expiry"],
                 "status": r["status"]
             })
-        # revoked list
+        # revoked list (from DB)
         rrows = conn.execute("SELECT license_id, revoked_at, revoked_reason, revoked_by FROM licenses WHERE status='revoked' ORDER BY revoked_at DESC LIMIT 200").fetchall()
         for rr in rrows:
             revoked.append({k: rr[k] for k in rr.keys()})
         activity = conn.execute("SELECT ts, event, details FROM activity_logs ORDER BY ts DESC LIMIT 40").fetchall()
-    return render_template_string(_ADMIN_HTML_REVOKE_ONLY, licenses=licenses, revoked=revoked, activity=activity, q=q, status=status)
+
+    # revoked file entries (limited)
+    revoked_file_entries = _revoked_file_entries(limit=200)
+
+    return render_template_string(_ADMIN_HTML_REVOKE_ONLY, licenses=licenses, revoked=revoked, activity=activity, revoked_file=revoked_file_entries, q=q, status=status)
 
 @app.route("/admin/revoke", methods=["POST"])
 @login_required
@@ -573,6 +746,13 @@ def admin_revoke():
         log_activity("revoke_error", {"license_id": license_id, "error": str(e)})
         flash(f"Failed to revoke: {e}", "error")
         return redirect(url_for("admin"))
+
+    # persist to revoked.txt
+    try:
+        _add_to_revoked_file(license_id, reason=reason, by=session.get("admin_user"))
+    except Exception as e:
+        log_activity("revoked_file_add_error", {"license_id": license_id, "error": str(e)})
+
     try:
         log_activity("revoke", {"license_id": license_id, "reason": reason, "by": session.get("admin_user")})
     except Exception:
@@ -623,6 +803,28 @@ def sign_api_compat():
     # forward to api_licenses_list_create for compatibility if allowed
     return api_licenses_list_create()
 
+# ---------------- Revoked file admin view & management ----------------
+@app.route("/admin/revoked_file", methods=["GET", "POST"])
+@login_required
+def admin_revoked_file():
+    # GET: show entries
+    if request.method == "GET":
+        entries = _revoked_file_entries(limit=500)
+        return jsonify({"count": len(entries), "entries": entries})
+    # POST: allow deletion of an entry (unrevoke from file)
+    data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    lid = data.get("license_id")
+    if action == "remove" and lid:
+        ok = _remove_from_revoked_file(lid)
+        if ok:
+            log_activity("revoked_file_removed", {"license_id": lid, "by": session.get("admin_user")})
+            return jsonify({"ok": True, "removed": True, "license_id": lid})
+        return jsonify({"ok": True, "removed": False, "license_id": lid})
+    return jsonify({"error": "invalid request"}), 400
+
+# ---------------- Admin UI also shows revoked file entries via admin() above ----------------
+
 # ---------------- Run ----------------
 if __name__ == "__main__":
     if _HAS_CRYPTO:
@@ -633,4 +835,11 @@ if __name__ == "__main__":
     else:
         print("cryptography not installed; signing endpoints disabled.")
     init_db()
+    # ensure revoked file exists (touch)
+    try:
+        Path(REVOKED_FILE).parent.mkdir(parents=True, exist_ok=True)
+        Path(REVOKED_FILE).touch(exist_ok=True)
+    except Exception:
+        pass
+    # initial load already executed above; run the app
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
